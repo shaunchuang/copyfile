@@ -1,24 +1,26 @@
 ---
-- name: Check CVE-2026-31431 (Copy Fail) exposure and patch status
+- name: Check CVE-2026-31431 Copy Fail exposure and patch status
   hosts: all
   become: true
   gather_facts: true
 
   vars:
-    # Fixed kmod versions per Ubuntu release (blocks algif_aead via modprobe rule)
+    # Ubuntu kmod versions that include a mitigation rule for algif_aead.
+    # Treat this as mitigation status, not as proof that the kernel itself is fixed.
     ubuntu_kmod_fixed:
       "22.04": "29-1ubuntu1.1"
       "24.04": "31+20240202-2ubuntu7.2"
 
-    # Fixed kernel versions per RHEL release
+    # RHEL-family fixed kernel versions.
+    # Note: RPM version comparison is more reliable than Ansible version()
+    # for exact vendor package validation. This is a best-effort report check.
     rhel_kernel_fixed:
       "8": "4.18.0-553.121.1.el8_10"
-      "9": "5.14.0-611.49.2.el9_7"
 
   tasks:
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # 1. Gather basic system info
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     - name: Show host and kernel
       ansible.builtin.debug:
         msg:
@@ -26,30 +28,32 @@
           - "Distribution: {{ ansible_distribution }} {{ ansible_distribution_version }}"
           - "Kernel: {{ ansible_kernel }}"
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # 2. Check kmod version (Ubuntu)
-    # ─────────────────────────────────────────────────────────────────────────
-    - name: Get installed kmod version (Ubuntu/Debian)
+    # -------------------------------------------------------------------------
+    # 2. Check kmod package version
+    # -------------------------------------------------------------------------
+    - name: Get installed kmod version on Debian or Ubuntu
       ansible.builtin.shell: |
         dpkg-query -W -f='${Version}' kmod 2>/dev/null || echo "NOT_INSTALLED"
       args:
         executable: /bin/bash
-      register: kmod_version
+      register: kmod_version_debian
       changed_when: false
+      failed_when: false
       when: ansible_os_family == "Debian"
 
-    - name: Get installed kmod version (RHEL)
+    - name: Get installed kmod version on RHEL family
       ansible.builtin.shell: |
         rpm -q --qf '%{VERSION}-%{RELEASE}' kmod 2>/dev/null || echo "NOT_INSTALLED"
       args:
         executable: /bin/bash
       register: kmod_version_rhel
       changed_when: false
+      failed_when: false
       when: ansible_os_family == "RedHat"
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # 3. Check algif_aead module status
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # 3. Check algif_aead / AF_ALG module status
+    # -------------------------------------------------------------------------
     - name: Check loaded crypto user API modules
       ansible.builtin.shell: |
         set -o pipefail
@@ -58,15 +62,17 @@
         executable: /bin/bash
       register: loaded_modules
       changed_when: false
+      failed_when: false
 
     - name: Check whether algif_aead or af_alg module files exist
       ansible.builtin.shell: |
         find /lib/modules/{{ ansible_kernel }} -type f 2>/dev/null \
-          | grep -E '/(algif_aead|af_alg)\.ko' || true
+          | grep -E '/(algif_aead|af_alg)\.ko(\.xz|\.zst|\.gz)?$' || true
       args:
         executable: /bin/bash
       register: module_files
       changed_when: false
+      failed_when: false
 
     - name: Check kernel config for CRYPTO_USER_API_AEAD
       ansible.builtin.shell: |
@@ -81,10 +87,11 @@
         executable: /bin/bash
       register: kernel_config
       changed_when: false
+      failed_when: false
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # 4. Check mitigations already in place
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # 4. Check existing mitigations
+    # -------------------------------------------------------------------------
     - name: Check boot cmdline mitigation
       ansible.builtin.shell: |
         cat /proc/cmdline | grep -E 'module_blacklist=.*algif_aead|modprobe\.blacklist=.*algif_aead|initcall_blacklist=.*algif_aead_init' || true
@@ -92,6 +99,7 @@
         executable: /bin/bash
       register: boot_mitigation
       changed_when: false
+      failed_when: false
 
     - name: Check modprobe.d mitigation
       ansible.builtin.shell: |
@@ -101,6 +109,7 @@
         executable: /bin/bash
       register: modprobe_mitigation
       changed_when: false
+      failed_when: false
 
     - name: Check whether AF_ALG socket can be created
       ansible.builtin.shell: |
@@ -119,36 +128,41 @@
       changed_when: false
       failed_when: false
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # 5. Determine patch / kmod status
-    # ─────────────────────────────────────────────────────────────────────────
-    - name: Evaluate Ubuntu kmod patch status
+    # -------------------------------------------------------------------------
+    # 5. Determine package / kernel patch status
+    # -------------------------------------------------------------------------
+    - name: Evaluate Ubuntu kmod mitigation status
       ansible.builtin.set_fact:
-        kmod_patched: >-
+        ubuntu_kmod_mitigation_patched: >-
           {% if ansible_distribution_version in ubuntu_kmod_fixed %}
-            {% set installed = kmod_version.stdout | default('0') %}
-            {% set fixed = ubuntu_kmod_fixed[ansible_distribution_version] %}
-            {{ installed is version(fixed, '>=') }}
+          {% set installed = kmod_version_debian.stdout | default('0') %}
+          {% set fixed = ubuntu_kmod_fixed[ansible_distribution_version] %}
+          {{ installed is version(fixed, '>=') }}
           {% else %}
-            unknown
+          unknown
           {% endif %}
       when: ansible_os_family == "Debian"
 
-    - name: Evaluate RHEL kernel patch status
+    - name: Evaluate RHEL-family kernel patch status
       ansible.builtin.set_fact:
         kernel_patched: >-
           {% set major = ansible_distribution_major_version %}
           {% if major in rhel_kernel_fixed %}
-            {{ ansible_kernel is version(rhel_kernel_fixed[major], '>=') }}
+          {{ ansible_kernel is version(rhel_kernel_fixed[major], '>=') }}
           {% else %}
-            unknown
+          unknown
           {% endif %}
       when: ansible_os_family == "RedHat"
 
-    # ─────────────────────────────────────────────────────────────────────────
+    - name: Normalize patch status defaults
+      ansible.builtin.set_fact:
+        ubuntu_kmod_mitigation_patched: "{{ ubuntu_kmod_mitigation_patched | default('unknown') | string | trim }}"
+        kernel_patched: "{{ kernel_patched | default('unknown') | string | trim }}"
+
+    # -------------------------------------------------------------------------
     # 6. Determine overall exposure level
-    # ─────────────────────────────────────────────────────────────────────────
-    - name: Determine Copy Fail exposure level
+    # -------------------------------------------------------------------------
+    - name: Determine Copy Fail exposure indicators
       ansible.builtin.set_fact:
         copyfail_loaded_algif: "{{ loaded_modules.stdout is search('^algif_aead', multiline=True) }}"
         copyfail_loaded_af_alg: "{{ loaded_modules.stdout is search('^af_alg', multiline=True) }}"
@@ -156,56 +170,88 @@
         copyfail_config_builtin: "{{ kernel_config.stdout is search('CONFIG_CRYPTO_USER_API_AEAD=y') }}"
         copyfail_config_module: "{{ kernel_config.stdout is search('CONFIG_CRYPTO_USER_API_AEAD=m') }}"
         copyfail_config_not_set: "{{ kernel_config.stdout is search('CONFIG_CRYPTO_USER_API_AEAD is not set') }}"
+        copyfail_config_unknown: "{{ kernel_config.stdout is search('CONFIG_NOT_FOUND') }}"
         copyfail_boot_mitigated: "{{ boot_mitigation.stdout | length > 0 }}"
         copyfail_modprobe_mitigated: "{{ modprobe_mitigation.stdout | length > 0 }}"
         copyfail_af_alg_allowed: "{{ af_alg_socket.stdout is search('AF_ALG_SOCKET_ALLOWED') }}"
 
-    - name: Classify risk
+    - name: Classify Copy Fail risk
       ansible.builtin.set_fact:
         copyfail_risk: >-
+          {% set kernel_fixed = (kernel_patched | default('unknown') | string | trim) == 'True' %}
+          {% set kmod_fixed = (ubuntu_kmod_mitigation_patched | default('unknown') | string | trim) == 'True' %}
           {% if copyfail_config_not_set %}
           not_affected
-          {% elif copyfail_boot_mitigated or copyfail_modprobe_mitigated %}
-          mitigated
-          {% elif copyfail_loaded_algif or copyfail_config_builtin %}
+          {% elif kernel_fixed %}
+          patched
+          {% elif copyfail_loaded_algif %}
           high
+          {% elif copyfail_config_builtin %}
+          high
+          {% elif kmod_fixed and not copyfail_loaded_algif %}
+          mitigated
+          {% elif (copyfail_boot_mitigated or copyfail_modprobe_mitigated) and not copyfail_loaded_algif %}
+          mitigated
           {% elif copyfail_config_module and copyfail_module_exists and copyfail_af_alg_allowed %}
           medium
           {% elif not copyfail_af_alg_allowed %}
           low
+          {% elif copyfail_config_unknown %}
+          unknown
           {% else %}
           unknown
           {% endif %}
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # 7. Print comprehensive result
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     - name: Print Copy Fail check result
       ansible.builtin.debug:
         msg:
           host: "{{ inventory_hostname }}"
           distribution: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
           kernel: "{{ ansible_kernel }}"
-          kmod_version: "{{ kmod_version.stdout | default(kmod_version_rhel.stdout | default('N/A')) }}"
-          kmod_patched: "{{ kmod_patched | default('N/A') | trim }}"
-          kernel_patched: "{{ kernel_patched | default('N/A') | trim }}"
+          kmod_version: >-
+            {{ kmod_version_debian.stdout
+               | default(kmod_version_rhel.stdout | default('N/A')) }}
+          ubuntu_kmod_mitigation_patched: "{{ ubuntu_kmod_mitigation_patched }}"
+          kernel_patched: "{{ kernel_patched }}"
           loaded_modules: "{{ loaded_modules.stdout_lines | default([]) }}"
           module_files: "{{ module_files.stdout_lines | default([]) }}"
           kernel_config: "{{ kernel_config.stdout_lines | default([]) }}"
           boot_mitigation: "{{ boot_mitigation.stdout_lines | default([]) }}"
           modprobe_mitigation: "{{ modprobe_mitigation.stdout_lines | default([]) }}"
           af_alg_socket: "{{ af_alg_socket.stdout }}"
+          indicators:
+            algif_aead_loaded: "{{ copyfail_loaded_algif }}"
+            af_alg_loaded: "{{ copyfail_loaded_af_alg }}"
+            module_file_exists: "{{ copyfail_module_exists }}"
+            config_builtin_y: "{{ copyfail_config_builtin }}"
+            config_module_m: "{{ copyfail_config_module }}"
+            config_not_set: "{{ copyfail_config_not_set }}"
+            boot_mitigated: "{{ copyfail_boot_mitigated }}"
+            modprobe_mitigated: "{{ copyfail_modprobe_mitigated }}"
+            af_alg_socket_allowed: "{{ copyfail_af_alg_allowed }}"
           risk: "{{ copyfail_risk | trim }}"
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # 8. Summary warning (report only, no remediation)
-    # ─────────────────────────────────────────────────────────────────────────
-    - name: Warn if system is vulnerable (report only)
+    # -------------------------------------------------------------------------
+    # 8. Summary warning, report only, no remediation
+    # -------------------------------------------------------------------------
+    - name: Warn when host requires attention
       ansible.builtin.debug:
         msg: >-
-          ⚠️  WARNING: {{ inventory_hostname }} is VULNERABLE to CVE-2026-31431 (Copy Fail).
+          WARNING: {{ inventory_hostname }} requires attention for CVE-2026-31431 Copy Fail.
           Distribution={{ ansible_distribution }} {{ ansible_distribution_version }},
           Kernel={{ ansible_kernel }},
           Risk={{ copyfail_risk | trim }}.
-          Recommend updating kmod/kernel or applying mitigation (blacklist algif_aead).
-      when: copyfail_risk | trim in ['high', 'medium']
+          Recommended action: confirm vendor kernel package/changelog, update kernel if needed,
+          or apply temporary mitigation such as blacklisting algif_aead.
+      when: copyfail_risk | trim in ['high', 'medium', 'unknown']
+
+    - name: Report hosts that appear patched, mitigated, low risk, or not affected
+      ansible.builtin.debug:
+        msg: >-
+          OK: {{ inventory_hostname }} result={{ copyfail_risk | trim }}.
+          Note: this playbook checks exposure and known package/version indicators;
+          final patch status should still be confirmed against the OS vendor advisory.
+      when: copyfail_risk | trim in ['patched', 'mitigated', 'low', 'not_affected']
