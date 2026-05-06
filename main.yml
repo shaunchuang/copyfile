@@ -1,44 +1,78 @@
 ---
-- name: Check CVE-2026-31431 (Copy Fail) exposure (report only)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Play 1: Write CSV header + handle unreachable hosts
+# ═══════════════════════════════════════════════════════════════════════════════
+- name: Initialize CSV and test connectivity
   hosts: all
-  become: true
-  gather_facts: true
+  gather_facts: false
+  become: false
 
   vars:
-    # ── Ubuntu: fix delivered via kmod package ──
-    ubuntu_kmod_fixed:
-      "22.04": "29-1ubuntu1.1"
-      "24.04": "31+20240202-2ubuntu7.2"
-      "20.04": "27-1ubuntu2.1+esm1"
-
-    # ── RHEL: fix delivered via kernel update ──
-    # Note: RHEL kernels have CONFIG_CRYPTO_USER_API_AEAD=y (built-in),
-    #       so modprobe blacklist does NOT work. Must update kernel or use
-    #       initcall_blacklist=algif_aead_init boot parameter.
-    rhel_kernel_fixed:
-      "8": "4.18.0-553.123.1.el8_10"
-      "9": "5.14.0-611.49.2.el9_7"
-
-    # CSV output path (on control node)
     csv_output: "./cve_2026_31431_report.csv"
 
   tasks:
-    # ═══════════════════════════════════════════════════════════════════════════
-    # CSV Header
-    # ═══════════════════════════════════════════════════════════════════════════
     - name: Write CSV header with UTF-8 BOM (for Excel)
       ansible.builtin.shell: |
         printf '\xEF\xBB\xBF主機名稱,IP,作業系統,目前 Kernel,目前 kmod,修補方式,需要版本,是否已修補,algif_aead 狀態,緩解措施,風險等級\n' > "{{ csv_output }}"
       args:
         executable: /bin/bash
       delegate_to: localhost
-      become: false
       run_once: true
       changed_when: true
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    - name: Test SSH connectivity
+      ansible.builtin.ping:
+      register: ping_result
+      ignore_errors: true
+      ignore_unreachable: true
+
+    - name: Record unreachable host to CSV
+      ansible.builtin.lineinfile:
+        path: "{{ csv_output }}"
+        line: "{{ inventory_hostname }},{{ inventory_hostname }},N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,連線失敗 (SSH unreachable)"
+        create: true
+        mode: "0644"
+      delegate_to: localhost
+      when: ping_result.unreachable is defined and ping_result.unreachable
+
+    - name: Mark host as reachable
+      ansible.builtin.set_fact:
+        host_reachable: true
+      when: ping_result.unreachable is not defined or not ping_result.unreachable
+
+    - name: Mark host as unreachable
+      ansible.builtin.set_fact:
+        host_reachable: false
+      when: ping_result.unreachable is defined and ping_result.unreachable
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Play 2: Perform CVE check on reachable hosts
+# ═══════════════════════════════════════════════════════════════════════════════
+- name: Check CVE-2026-31431 (Copy Fail) exposure (report only)
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    ubuntu_kmod_fixed:
+      "22.04": "29-1ubuntu1.1"
+      "24.04": "31+20240202-2ubuntu7.2"
+      "20.04": "27-1ubuntu2.1+esm1"
+
+    rhel_kernel_fixed:
+      "8": "4.18.0-553.121.1.el8_10"
+      "9": "5.14.0-611.49.2.el9_7"
+
+    csv_output: "./cve_2026_31431_report.csv"
+
+  tasks:
+    - name: Skip unreachable hosts
+      ansible.builtin.meta: end_host
+      when: hostvars[inventory_hostname].host_reachable is not defined or not hostvars[inventory_hostname].host_reachable
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Gather package versions
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ─────────────────────────────────────────────────────────────────────────
     - name: Get kmod version (Debian)
       ansible.builtin.shell: |
         dpkg-query -W -f='${Version}' kmod 2>/dev/null || echo "N/A"
@@ -57,9 +91,9 @@
       changed_when: false
       when: ansible_os_family == "RedHat"
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ─────────────────────────────────────────────────────────────────────────
     # Check algif_aead runtime state
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ─────────────────────────────────────────────────────────────────────────
     - name: Check if algif_aead is loaded
       ansible.builtin.shell: |
         grep -q '^algif_aead ' /proc/modules && echo "loaded" || echo "not_loaded"
@@ -82,9 +116,9 @@
       register: config_aead
       changed_when: false
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ─────────────────────────────────────────────────────────────────────────
     # Check existing mitigations
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ─────────────────────────────────────────────────────────────────────────
     - name: Check boot parameter mitigation
       ansible.builtin.shell: |
         grep -qE 'initcall_blacklist=.*algif_aead_init|module_blacklist=.*algif_aead|modprobe\.blacklist=.*algif_aead' /proc/cmdline && echo "yes" || echo "no"
@@ -101,36 +135,29 @@
       register: modprobe_mitigated
       changed_when: false
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ─────────────────────────────────────────────────────────────────────────
     # Determine patch status and risk
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ─────────────────────────────────────────────────────────────────────────
     - name: Calculate results
       ansible.builtin.set_fact:
-        # IP
         host_ip: "{{ ansible_default_ipv4.address | default(ansible_all_ipv4_addresses[0] | default('N/A')) }}"
-
-        # kmod version string
         current_kmod: "{{ kmod_ver.stdout | default(kmod_ver_rh.stdout | default('N/A')) }}"
 
-        # Patch method description
         patch_method: >-
           {% if ansible_os_family == 'Debian' %}kmod 套件更新
           {% elif ansible_os_family == 'RedHat' %}kernel 更新
           {% else %}unknown{% endif %}
 
-        # Required version
         required_version: >-
           {% if ansible_os_family == 'Debian' and ansible_distribution_version in ubuntu_kmod_fixed %}kmod >= {{ ubuntu_kmod_fixed[ansible_distribution_version] }}
           {% elif ansible_os_family == 'RedHat' and ansible_distribution_major_version in rhel_kernel_fixed %}kernel >= {{ rhel_kernel_fixed[ansible_distribution_major_version] }}
           {% else %}請查閱官方公告{% endif %}
 
-        # Is patched?
         is_patched: >-
           {% if ansible_os_family == 'Debian' and ansible_distribution_version in ubuntu_kmod_fixed %}{% set installed = kmod_ver.stdout | default('0') %}{% set fixed = ubuntu_kmod_fixed[ansible_distribution_version] %}{% if installed is version(fixed, '>=') %}是{% else %}否{% endif %}
           {% elif ansible_os_family == 'RedHat' and ansible_distribution_major_version in rhel_kernel_fixed %}{% set fixed = rhel_kernel_fixed[ansible_distribution_major_version] %}{% if ansible_kernel is version(fixed, '>=') %}是{% else %}否{% endif %}
           {% else %}未知{% endif %}
 
-        # algif_aead status
         algif_status: >-
           {% if config_aead.stdout is search('=y') %}built-in (已編入核心)
           {% elif algif_state.stdout == 'loaded' %}module 已載入
@@ -138,7 +165,6 @@
           {% elif config_aead.stdout is search('is not set') %}未啟用 (安全)
           {% else %}無法判斷{% endif %}
 
-        # Mitigation status
         mitigation_status: >-
           {% if boot_mitigated.stdout == 'yes' and modprobe_mitigated.stdout == 'yes' %}boot 參數 + modprobe 封鎖
           {% elif boot_mitigated.stdout == 'yes' %}boot 參數封鎖
@@ -161,9 +187,9 @@
           {% elif config_aead.stdout is search('=m') %}medium
           {% else %}unknown{% endif %}
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ─────────────────────────────────────────────────────────────────────────
     # Output
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ─────────────────────────────────────────────────────────────────────────
     - name: Print result
       ansible.builtin.debug:
         msg: >-
