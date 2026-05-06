@@ -26,14 +26,15 @@
     # ═══════════════════════════════════════════════════════════════════════════
     # CSV Header
     # ═══════════════════════════════════════════════════════════════════════════
-    - name: Write CSV header
-      ansible.builtin.copy:
-        dest: "{{ csv_output }}"
-        content: "主機名稱,IP,作業系統,目前 Kernel,目前 kmod,修補方式,需要版本,是否已修補,algif_aead 狀態,緩解措施,風險等級\n"
-        mode: "0644"
+    - name: Write CSV header with UTF-8 BOM (for Excel)
+      ansible.builtin.shell: |
+        printf '\xEF\xBB\xBF主機名稱,IP,作業系統,目前 Kernel,目前 kmod,修補方式,需要版本,是否已修補,algif_aead 狀態,緩解措施,風險等級\n' > "{{ csv_output }}"
+      args:
+        executable: /bin/bash
       delegate_to: localhost
       become: false
       run_once: true
+      changed_when: true
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Gather package versions
