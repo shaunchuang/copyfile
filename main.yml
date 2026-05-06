@@ -29,7 +29,7 @@
     - name: Record unreachable host to CSV
       ansible.builtin.lineinfile:
         path: "{{ csv_output }}"
-        line: "{{ inventory_hostname }},{{ inventory_hostname }},N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,連線失敗 (SSH unreachable)"
+        line: "N/A (無法取得),{{ inventory_hostname }},N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,連線失敗 (SSH unreachable)"
         create: true
         mode: "0644"
       delegate_to: localhost
@@ -193,7 +193,7 @@
     - name: Print result
       ansible.builtin.debug:
         msg: >-
-          [{{ risk_level | trim }}] {{ inventory_hostname }} ({{ host_ip }})
+          [{{ risk_level | trim }}] {{ ansible_hostname }} ({{ host_ip }})
           — {{ ansible_distribution }} {{ ansible_distribution_version }}
           — 修補: {{ is_patched | trim }}
           — algif_aead: {{ algif_status | trim }}
@@ -202,7 +202,7 @@
       ansible.builtin.lineinfile:
         path: "{{ csv_output }}"
         line: >-
-          {{ inventory_hostname }},{{ host_ip }},{{ ansible_distribution }} {{ ansible_distribution_version }},{{ ansible_kernel }},{{ current_kmod }},{{ patch_method | trim }},{{ required_version | trim }},{{ is_patched | trim }},{{ algif_status | trim }},{{ mitigation_status | trim }},{{ risk_level | trim }}
+          {{ ansible_hostname }},{{ host_ip }},{{ ansible_distribution }} {{ ansible_distribution_version }},{{ ansible_kernel }},{{ current_kmod }},{{ patch_method | trim }},{{ required_version | trim }},{{ is_patched | trim }},{{ algif_status | trim }},{{ mitigation_status | trim }},{{ risk_level | trim }}
         create: true
         mode: "0644"
       delegate_to: localhost
